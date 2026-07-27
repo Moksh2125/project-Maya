@@ -1,0 +1,139 @@
+/* index.css — Maya global design tokens & glassmorphism utilities */
+
+/* ── Tailwind Directives (MUST be first) ───────────────────── */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap");
+
+/* ── Design Tokens ─────────────────────────────────────────── */
+:root {
+  --maya-50:  #f0f4ff;
+  --maya-200: #c7d7fe;
+  --maya-400: #8198f8;
+  --maya-500: #6370f1;
+  --maya-600: #4f4fe6;
+  --maya-900: #302f80;
+  --maya-950: #1e1c4b;
+
+  --glass-bg:     rgba(255, 255, 255, 0.07);
+  --glass-border: rgba(255, 255, 255, 0.12);
+  --glass-blur:   24px;
+
+  --shadow-glow: 0 0 60px rgba(99, 112, 241, 0.3);
+  --radius-lg:   1.25rem;
+  --radius-xl:   2rem;
+
+  --transition-smooth: 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* ── Reset ─────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: "Inter", system-ui, sans-serif;
+  background: transparent;
+  color: #e8eaff;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* ── App Root ──────────────────────────────────────────────── */
+.app-root {
+  width: 100vw;
+  height: 100vh;
+  background: linear-gradient(135deg, #0d0c1e 0%, #1a1535 50%, #0f1629 100%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  overflow: hidden;
+}
+
+/* ── Ambient Orbs ──────────────────────────────────────────── */
+.orb {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(80px);
+  opacity: 0.35;
+  pointer-events: none;
+  animation: orb-drift 12s ease-in-out infinite alternate;
+}
+.orb-1 { width: 500px; height: 500px; background: #6370f1; top: -150px; left: -120px; }
+.orb-2 { width: 350px; height: 350px; background: #a855f7; bottom: -100px; right: -80px; animation-delay: -4s; }
+.orb-3 { width: 250px; height: 250px; background: #06b6d4; top: 40%; left: 55%; animation-delay: -8s; }
+
+@keyframes orb-drift {
+  from { transform: translate(0, 0) scale(1); }
+  to   { transform: translate(30px, -30px) scale(1.05); }
+}
+
+/* ── Titlebar (drag region) ────────────────────────────────── */
+.titlebar {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  height: 32px;
+  -webkit-app-region: drag;
+  z-index: 9999;
+}
+
+/* ── Glass Panel ───────────────────────────────────────────── */
+.glass-panel {
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-glow), 0 25px 50px rgba(0, 0, 0, 0.5);
+  padding: 2rem;
+  width: min(860px, 92vw);
+  min-height: 560px;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  position: relative;
+  z-index: 1;
+}
+
+/* ── Panel Header ──────────────────────────────────────────── */
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.brand {
+  font-size: 1.75rem;
+  font-weight: 700;
+  background: linear-gradient(90deg, #a5bcfc, #e879f9);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  letter-spacing: -0.02em;
+}
+
+/* ── Status Badge ──────────────────────────────────────────── */
+.status-badge {
+  padding: 0.25rem 0.85rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border: 1px solid;
+}
+.status-idle      { color: #94a3b8; border-color: #334155; background: rgba(51,65,85,0.4); }
+.status-listening { color: #86efac; border-color: #16a34a; background: rgba(22,163,74,0.15); }
+.status-thinking  { color: #fbbf24; border-color: #d97706; background: rgba(217,119,6,0.15); }
+.status-speaking  { color: #818cf8; border-color: #4f46e5; background: rgba(79,70,229,0.15); }
+.status-error     { color: #f87171; border-color: #dc2626; background: rgba(220,38,38,0.15); }
+
+/* ── Component Slots ───────────────────────────────────────── */
+.component-slot {
+  flex: 1;
+  border-radius: var(--radius-lg);
+  background: rgba(255,255,255,0.03);
+  border: 1px dashed rgba(255,255,255,0.08);
+  min-height: 80px;
+}

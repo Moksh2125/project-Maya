@@ -1,0 +1,32 @@
+PROJECT MAYA - OFFLINE AI ASSISTANT
+===================================
+CURRENT STATE: Phase 1 (Foundation & Architecture Scaffolding)
+- [x] Tech stack defined.
+- [x] Repository structure mapped.
+- [x] FastAPI skeleton with WebSocket/REST endpoints established.
+- [x] React + Tailwind glassmorphism UI initialized.
+- [ ] Install Python dependencies (Faster-Whisper, Piper, Ollama).
+- [ ] Download Gemma 3 270M via Ollama.
+- [ ] Wire audio hardware to STT/TTS pipelines.
+
+SETUP INSTRUCTIONS
+------------------
+1. Initialize Frontend:
+   cd frontend
+   npm create vite@latest . -- --template react-ts
+   npm install -D tailwindcss postcss autoprefixer electron concurrently wait-on
+   npx tailwindcss init -p
+   npm install framer-motion lucide-react zustand
+
+2. Initialize Backend:
+   cd ../backend
+   python -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   pip install fastapi uvicorn websockets ollama faster-whisper openwakeword psutil
+
+3. Run Development Environment:
+   # Terminal 1 (Backend):
+   cd backend && source venv/bin/activate && uvicorn main:app --reload --port 8000
+   
+   # Terminal 2 (Frontend):
+   cd frontend && npm run dev

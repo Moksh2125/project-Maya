@@ -1,0 +1,8 @@
+# backend/data/
+# SQLite database files and conversation history are stored here.
+# This directory is git-ignored for sensitive data.
+#
+# Expected files at runtime:
+#   maya.db              — SQLite database (auto-created by SQLAlchemy)
+#   conversations/       — JSON conversation logs (optional)
+#   voices/              — Piper TTS .onnx voice model files

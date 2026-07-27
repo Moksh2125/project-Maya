@@ -1,0 +1,27 @@
+# Node / Frontend
+node_modules/
+dist/
+dist-electron/
+.env
+.env.local
+
+# Python / Backend
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+
+# Piper TTS & Large Binaries
+backend/piper/
+backend/test_out.wav
+*.onnx
+*.onnx.json
+
+# IDEs and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
