@@ -1,14 +1,57 @@
 import asyncio
-import struct
+import json
 import threading
+import wave
 import psutil
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 
-from core import stt, llm, tts, wakeword
+# ── Real pipeline modules ──────────────────────────────────────────────────────
+from router import route_task
+from core.llm import generate_chat, warmup
+from core.stt import transcribe
+from core.tts import synthesize
+from core.wakeword import wake_word_listener
 
-app = FastAPI(title="Maya AI Core")
+# -------------------------------------------------------------
+# GLOBAL STATE
+# -------------------------------------------------------------
+active_websocket: WebSocket | None = None
+maya_is_speaking = False          # Shared flag — read by wake_word thread
 
+# -------------------------------------------------------------
+# LIFESPAN & BACKGROUND TASKS
+# -------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start the real OpenWakeWord listener in a daemon thread on startup."""
+    print("Initializing OpenWakeWord Engine...")
+
+    loop = asyncio.get_running_loop()
+
+    # wake_word_listener is a BLOCKING function (PyAudio reads).
+    # Run it in a background daemon thread so it never blocks the event loop.
+    ww_thread = threading.Thread(
+        target=wake_word_listener,
+        args=(loop, on_command_recorded, lambda: maya_is_speaking),
+        daemon=True,           # Dies automatically when the server shuts down
+        name="WakeWordThread",
+    )
+    ww_thread.start()
+
+    # Pre-warm the LLM so the first conversational query isn't cold-slow.
+    # Runs concurrently — doesn't block the server from accepting requests.
+    asyncio.create_task(warmup())
+
+    yield
+    print("Shutting down Maya Engine...")
+
+
+# Initialize FastAPI with the lifespan manager
+app = FastAPI(lifespan=lifespan)
+
+# Allow React / Electron frontend to connect
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,160 +60,122 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# WebSocket tracking set
-active_websockets = set()
-
-# ── Echo Cancellation State ───────────────────────────────────────────────────
-# maya_is_speaking: tells wakeword thread to mute the mic.
-# pipeline_running: prevents a second pipeline from starting while one is active.
-maya_is_speaking = False
-pipeline_running = False
-
-session_history = [
-    {
-        "role": "system",
-        "content": "You are Maya, an offline AI desktop assistant. Keep answers concise, natural, and conversational.",
-    }
-]
-
-
-def get_wav_duration(wav_bytes: bytes) -> float:
-    """
-    Parse the RIFF/WAV header to extract the exact audio duration in seconds.
-    This lets us mute the mic for precisely as long as the audio plays, rather
-    than using a blind fixed sleep.
-
-    WAV header layout (all little-endian):
-      offset 22 → num_channels (uint16)
-      offset 24 → sample_rate  (uint32)
-      offset 34 → bits_per_sample (uint16)
-      offset 40 → data chunk size in bytes (uint32)
-    """
-    try:
-        num_channels   = struct.unpack_from('<H', wav_bytes, 22)[0]
-        sample_rate    = struct.unpack_from('<I', wav_bytes, 24)[0]
-        bits_per_sample = struct.unpack_from('<H', wav_bytes, 34)[0]
-        data_size      = struct.unpack_from('<I', wav_bytes, 40)[0]
-        bytes_per_frame = num_channels * (bits_per_sample // 8)
-        num_frames     = data_size // bytes_per_frame
-        return num_frames / sample_rate
-    except Exception:
-        return 5.0  # safe fallback if header is malformed
-
-
-def check_is_speaking() -> bool:
-    """Callback for the wakeword thread — returns True when mic should be muted."""
-    return maya_is_speaking
-
-
-async def broadcast_ws(message: dict):
-    """Push a JSON message to all connected UI clients."""
-    for ws in list(active_websockets):
-        try:
-            await ws.send_json(message)
-        except Exception:
-            pass
-
-
-async def process_voice_command(audio_bytes: bytes):
-    """End-to-End Pipeline: STT → LLM → TTS → Audio Broadcast."""
-    global maya_is_speaking, pipeline_running
-
-    # ── Concurrency Guard (Bug 3 fix) ────────────────────────────────────────
-    # Drop any new trigger that arrives while a pipeline is already running.
-    # This prevents overlapping calls caused by the mic briefly capturing
-    # audio right before the mute flag is set.
-    if pipeline_running:
-        print("[Pipeline] Already running — dropping duplicate trigger.")
-        return
-    pipeline_running = True
-
-    try:
-        await broadcast_ws({"type": "state", "status": "processing"})
-
-        # ── Step 1: Speech-to-Text ────────────────────────────────────────────
-        print("[1/3] Transcribing audio with Faster-Whisper...")
-        user_text = await stt.transcribe(audio_bytes)
-        if not user_text:
-            print("-> Empty speech result. Resetting state.")
-            await broadcast_ws({"type": "state", "status": "standby"})
-            return
-
-        print(f"-> User said: '{user_text}'")
-        await broadcast_ws({"type": "text", "sender": "user", "content": user_text})
-
-        # ── Step 2: Local LLM ─────────────────────────────────────────────────
-        print("[2/3] Generating response with Gemma 3...")
-        session_history.append({"role": "user", "content": user_text})
-        maya_text = await llm.chat(session_history)
-        session_history.append({"role": "assistant", "content": maya_text})
-
-        print(f"-> Maya says: '{maya_text}'")
-        await broadcast_ws({"type": "text", "sender": "maya", "content": maya_text})
-
-        # ── Step 3: TTS Synthesis ─────────────────────────────────────────────
-        print("[3/3] Synthesizing speech with Piper...")
-        audio_response_bytes = await tts.synthesize(maya_text)
-
-        # Calculate exact playback duration from WAV header BEFORE sending.
-        audio_duration = get_wav_duration(audio_response_bytes)
-        mute_duration = audio_duration + 0.5  # +0.5s buffer for room echo tail
-
-        # ── Mute BEFORE sending (Bug 2 + timing fix) ─────────────────────────
-        # Set the flag here so the wakeword thread starts draining the mic
-        # buffer the instant audio hits the speakers — not 4 seconds later.
-        maya_is_speaking = True
-        print(f"[Pipeline] Muting mic for {audio_duration:.1f}s audio + 0.5s echo tail")
-
-        # Broadcast audio bytes to frontend
-        for ws in list(active_websockets):
-            try:
-                await ws.send_bytes(audio_response_bytes)
-            except Exception as e:
-                print(f"[Pipeline] WebSocket audio error: {e}")
-
-        # Sleep for the exact duration of the audio clip + echo tail
-        await asyncio.sleep(mute_duration)
-
-    except Exception as e:
-        print(f"!!! CRITICAL PIPELINE ERROR [{type(e).__name__}]: {e}")
-
-    finally:
-        # Always clear both flags so the system returns to standby
-        maya_is_speaking = False
-        pipeline_running = False
-        await broadcast_ws({"type": "state", "status": "standby"})
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Spawns the background wake word listener on app boot."""
-    loop = asyncio.get_running_loop()
-    threading.Thread(
-        target=wakeword.wake_word_listener,
-        args=(loop, process_voice_command, check_is_speaking),
-        daemon=True,
-    ).start()
-
-
+# -------------------------------------------------------------
+# API ENDPOINTS
+# -------------------------------------------------------------
 @app.get("/status")
-async def get_system_status():
-    """System hardware telemetry endpoint for UI gauges."""
+async def get_status():
+    """Provides live telemetry to the React UI."""
     return {
-        "cpu_percent": psutil.cpu_percent(),
+        "cpu_percent": psutil.cpu_percent(interval=0.1),
         "ram_percent": psutil.virtual_memory().percent,
-        "ai_engine": "Ollama (Gemma 3 270M)",
-        "status": "online",
     }
-
 
 @app.websocket("/ws/audio")
-async def audio_endpoint(websocket: WebSocket):
-    """Main control channel connecting Python backend to React UI."""
+async def websocket_endpoint(websocket: WebSocket):
+    """Handles the real-time connection with the React frontend."""
+    global active_websocket
     await websocket.accept()
-    active_websockets.add(websocket)
+    active_websocket = websocket
+    print("INFO: WebSocket /ws/audio [accepted]")
+
     try:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
-        active_websockets.discard(websocket)
+        active_websocket = None
+        print("INFO: WebSocket disconnected.")
+
+# -------------------------------------------------------------
+# UI HELPERS (safe to call from any coroutine)
+# -------------------------------------------------------------
+async def update_ui_state(status: str):
+    """Push a state change to the React UI."""
+    if active_websocket:
+        try:
+            await active_websocket.send_text(
+                json.dumps({"type": "state", "status": status})
+            )
+        except Exception:
+            pass
+
+async def update_ui_chat(sender: str, content: str):
+    """Push a chat bubble to the React UI."""
+    if active_websocket:
+        try:
+            await active_websocket.send_text(
+                json.dumps({"type": "text", "sender": sender, "content": content})
+            )
+        except Exception:
+            pass
+
+# -------------------------------------------------------------
+# CORE PIPELINE — called by the wake word thread via run_coroutine_threadsafe
+# -------------------------------------------------------------
+async def on_command_recorded(wav_bytes: bytes):
+    """
+    Full async pipeline triggered once the wake word thread captures a command.
+    Runs on the main asyncio event loop.
+
+    Flow: WAV bytes → STT → Router (regex / LLM) → TTS → WebSocket
+    """
+    global maya_is_speaking
+
+    await update_ui_state("listening")
+
+    # ── 1. TRANSCRIPTION ──────────────────────────────────────────────────────
+    print("[1/3] Transcribing audio with Faster-Whisper...")
+    await update_ui_state("processing")
+
+    user_text = await transcribe(wav_bytes)
+
+    if not user_text.strip():
+        print("-> Empty speech result. Resetting state.")
+        await update_ui_state("standby")
+        return
+
+    print(f"-> User said: '{user_text}'")
+    await update_ui_chat("user", user_text)
+
+    # ── 2. HYBRID ROUTER (Regex → Python services → LLM) ────────────────────
+    print("[2/3] Routing Task (Hybrid Engine)...")
+    maya_response = await route_task(user_text, generate_chat)
+
+    print(f"-> Maya says: '{maya_response}'")
+    await update_ui_chat("maya", maya_response)
+
+    # ── 3. SPEECH SYNTHESIS ───────────────────────────────────────────────────
+    print("[3/3] Synthesizing speech with Piper...")
+    try:
+        tts_audio_bytes = await synthesize(maya_response)
+    except Exception as e:
+        print(f"[TTS Error]: {e}")
+        tts_audio_bytes = None
+
+    if active_websocket and tts_audio_bytes:
+        # Calculate exact playback duration so the wake word thread mutes for
+        # exactly as long as the audio plays (avoids echo false-triggers).
+        with wave.open(__import__("io").BytesIO(tts_audio_bytes)) as wf:
+            duration_s = wf.getnframes() / wf.getframerate()
+
+        mute_duration = duration_s + 0.5   # +0.5s echo tail
+        print(f"[Pipeline] Muting mic for {mute_duration:.1f}s audio + 0.5s echo tail")
+
+        maya_is_speaking = True
+        try:
+            await active_websocket.send_bytes(tts_audio_bytes)
+        except Exception:
+            pass
+
+        await asyncio.sleep(mute_duration)
+        maya_is_speaking = False
+        
+        # ── NEW: EXECUTE SHUTDOWN AFTER AUDIO FINISHES ──
+        if maya_response == "Shutting down the system. Goodbye!":
+            import os
+            import signal
+            print("[System] Audio finished playing. Pulling the plug.")
+            os.kill(os.getpid(), signal.SIGINT)
+
+    else:
+        await update_ui_state("standby")
