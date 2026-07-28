@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   Mic, Loader2, Cpu, HardDrive, Activity,
-  Sparkles, Terminal
+  Sparkles, Terminal, History
 } from 'lucide-react';
+import HistoryPage from './pages/HistoryPage';
 
 interface Message {
   sender: string;
@@ -20,6 +21,7 @@ export default function App() {
   const [sysStatus, setSysStatus] = useState<SysStatus>({ cpu: 0, ram: 0 });
   const [hasInteracted, setHasInteracted] = useState<boolean>(false);
   const [wsConnected, setWsConnected] = useState<boolean>(false);
+  const [view, setView] = useState<'live' | 'history'>('live');
 
   const ws = useRef<WebSocket | null>(null);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
@@ -124,6 +126,10 @@ export default function App() {
     if (!hasInteracted) setHasInteracted(true);
   };
 
+  if (view === 'history') {
+    return <HistoryPage onBack={() => setView('live')} />;
+  }
+
   return (
     <div
       className="h-screen w-screen bg-slate-950 text-slate-100 flex flex-col font-sans select-none overflow-hidden"
@@ -160,6 +166,15 @@ export default function App() {
             <span className={`h-2 w-2 rounded-full ${wsConnected ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]' : 'bg-rose-500'}`} />
             <span className="text-slate-400 uppercase text-[11px]">{wsConnected ? 'Connected' : 'Offline'}</span>
           </div>
+
+          <button
+            onClick={(e) => { e.stopPropagation(); setView('history'); }}
+            className="flex items-center gap-2 bg-slate-800/50 hover:bg-slate-800 px-3 py-1.5 rounded-md border border-slate-700/50 transition-colors"
+            aria-label="View chat history"
+          >
+            <History className="w-3.5 h-3.5 text-slate-300" />
+            <span className="text-slate-300 uppercase text-[11px]">History</span>
+          </button>
         </div>
       </header>
 
@@ -184,8 +199,8 @@ export default function App() {
             >
               <div
                 className={`max-w-[70%] px-4 py-3 rounded-2xl text-sm leading-relaxed shadow-lg ${msg.sender === 'user'
-                    ? 'bg-gradient-to-r from-cyan-600 to-cyan-500 text-white rounded-br-none border border-cyan-400/20'
-                    : 'bg-slate-900/80 backdrop-blur-md border border-slate-800 text-slate-200 rounded-bl-none font-sans'
+                  ? 'bg-gradient-to-r from-cyan-600 to-cyan-500 text-white rounded-br-none border border-cyan-400/20'
+                  : 'bg-slate-900/80 backdrop-blur-md border border-slate-800 text-slate-200 rounded-bl-none font-sans'
                   }`}
               >
                 {msg.text}

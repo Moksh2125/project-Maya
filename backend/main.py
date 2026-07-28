@@ -3,7 +3,8 @@ import json
 import threading
 import wave
 import psutil
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from datetime import datetime
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
@@ -13,12 +14,20 @@ from core.llm import generate_chat, warmup
 from core.stt import transcribe
 from core.tts import synthesize
 from core.wakeword import wake_word_listener
+from services.chat_history_service import save_session, get_all_sessions, get_session, delete_session
 
 # -------------------------------------------------------------
 # GLOBAL STATE
 # -------------------------------------------------------------
 active_websocket: WebSocket | None = None
 maya_is_speaking = False          # Shared flag — read by wake_word thread
+
+# ── Live session transcript buffer ────────────────────────────────────────────
+# Every user/Maya turn in the CURRENT run gets appended here. It is flushed to
+# SQLite (chat_history_service.save_session) the moment the "stop" command
+# fires, so a full session is written as one record in the History page.
+session_messages: list[dict] = []
+session_started_at: datetime | None = None
 
 # -------------------------------------------------------------
 # LIFESPAN & BACKGROUND TASKS
@@ -71,6 +80,30 @@ async def get_status():
         "ram_percent": psutil.virtual_memory().percent,
     }
 
+
+@app.get("/history")
+async def list_history():
+    """Returns every saved chat session, most recent first."""
+    return get_all_sessions()
+
+
+@app.get("/history/{session_id}")
+async def read_history(session_id: int):
+    """Returns a single saved chat session by id."""
+    session = get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session
+
+
+@app.delete("/history/{session_id}")
+async def remove_history(session_id: int):
+    """Deletes a single saved chat session by id."""
+    if not delete_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"deleted": session_id}
+
+
 @app.websocket("/ws/audio")
 async def websocket_endpoint(websocket: WebSocket):
     """Handles the real-time connection with the React frontend."""
@@ -109,6 +142,18 @@ async def update_ui_chat(sender: str, content: str):
         except Exception:
             pass
 
+
+def _record_turn(sender: str, content: str):
+    """Appends one turn to the in-memory session transcript."""
+    global session_started_at
+    if session_started_at is None:
+        session_started_at = datetime.now()
+    session_messages.append({
+        "sender": sender,
+        "content": content,
+        "timestamp": datetime.now().isoformat(),
+    })
+
 # -------------------------------------------------------------
 # CORE PIPELINE — called by the wake word thread via run_coroutine_threadsafe
 # -------------------------------------------------------------
@@ -136,6 +181,7 @@ async def on_command_recorded(wav_bytes: bytes):
 
     print(f"-> User said: '{user_text}'")
     await update_ui_chat("user", user_text)
+    _record_turn("user", user_text)
 
     # ── 2. HYBRID ROUTER (Regex → Python services → LLM) ────────────────────
     print("[2/3] Routing Task (Hybrid Engine)...")
@@ -143,6 +189,7 @@ async def on_command_recorded(wav_bytes: bytes):
 
     print(f"-> Maya says: '{maya_response}'")
     await update_ui_chat("maya", maya_response)
+    _record_turn("maya", maya_response)
 
     # ── 3. SPEECH SYNTHESIS ───────────────────────────────────────────────────
     print("[3/3] Synthesizing speech with Piper...")
@@ -169,11 +216,18 @@ async def on_command_recorded(wav_bytes: bytes):
 
         await asyncio.sleep(mute_duration)
         maya_is_speaking = False
-        
-        # ── NEW: EXECUTE SHUTDOWN AFTER AUDIO FINISHES ──
+
+        # ── EXECUTE SHUTDOWN AFTER AUDIO FINISHES ──
         if maya_response == "Shutting down the system. Goodbye!":
             import os
             import signal
+
+            # Flush the whole live session to SQLite BEFORE the process dies.
+            # This is the "stop" trigger point the History page reads from.
+            if session_messages:
+                saved_id = save_session(session_messages, session_started_at, datetime.now())
+                print(f"[History] Saved session #{saved_id} ({len(session_messages)} turns).")
+
             print("[System] Audio finished playing. Pulling the plug.")
             os.kill(os.getpid(), signal.SIGINT)
 
