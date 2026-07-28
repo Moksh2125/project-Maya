@@ -1,3 +1,4 @@
+import os
 import asyncio
 import json
 import threading
@@ -23,9 +24,6 @@ active_websocket: WebSocket | None = None
 maya_is_speaking = False          # Shared flag — read by wake_word thread
 
 # ── Live session transcript buffer ────────────────────────────────────────────
-# Every user/Maya turn in the CURRENT run gets appended here. It is flushed to
-# SQLite (chat_history_service.save_session) the moment the "stop" command
-# fires, so a full session is written as one record in the History page.
 session_messages: list[dict] = []
 session_started_at: datetime | None = None
 
@@ -34,30 +32,21 @@ session_started_at: datetime | None = None
 # -------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Start the real OpenWakeWord listener in a daemon thread on startup."""
     print("Initializing OpenWakeWord Engine...")
-
     loop = asyncio.get_running_loop()
 
-    # wake_word_listener is a BLOCKING function (PyAudio reads).
-    # Run it in a background daemon thread so it never blocks the event loop.
     ww_thread = threading.Thread(
         target=wake_word_listener,
         args=(loop, on_command_recorded, lambda: maya_is_speaking),
-        daemon=True,           # Dies automatically when the server shuts down
+        daemon=True,
         name="WakeWordThread",
     )
     ww_thread.start()
 
-    # Pre-warm the LLM so the first conversational query isn't cold-slow.
-    # Runs concurrently — doesn't block the server from accepting requests.
     asyncio.create_task(warmup())
-
     yield
     print("Shutting down Maya Engine...")
 
-
-# Initialize FastAPI with the lifespan manager
 app = FastAPI(lifespan=lifespan)
 
 # Allow React / Electron frontend to connect
@@ -74,44 +63,36 @@ app.add_middleware(
 # -------------------------------------------------------------
 @app.get("/status")
 async def get_status():
-    """Provides live telemetry to the React UI."""
     return {
         "cpu_percent": psutil.cpu_percent(interval=0.1),
         "ram_percent": psutil.virtual_memory().percent,
     }
 
-
 @app.get("/history")
 async def list_history():
-    """Returns every saved chat session, most recent first."""
+    """Returns every saved chat session, most recent first (for the sidebar)."""
     return get_all_sessions()
-
 
 @app.get("/history/{session_id}")
 async def read_history(session_id: int):
-    """Returns a single saved chat session by id."""
+    """Returns a single saved chat session by id (for the main chat window)."""
     session = get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
     return session
 
-
 @app.delete("/history/{session_id}")
 async def remove_history(session_id: int):
-    """Deletes a single saved chat session by id."""
     if not delete_session(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
     return {"deleted": session_id}
 
-
 @app.websocket("/ws/audio")
 async def websocket_endpoint(websocket: WebSocket):
-    """Handles the real-time connection with the React frontend."""
     global active_websocket
     await websocket.accept()
     active_websocket = websocket
     print("INFO: WebSocket /ws/audio [accepted]")
-
     try:
         while True:
             await websocket.receive_text()
@@ -120,31 +101,23 @@ async def websocket_endpoint(websocket: WebSocket):
         print("INFO: WebSocket disconnected.")
 
 # -------------------------------------------------------------
-# UI HELPERS (safe to call from any coroutine)
+# UI HELPERS
 # -------------------------------------------------------------
 async def update_ui_state(status: str):
-    """Push a state change to the React UI."""
     if active_websocket:
         try:
-            await active_websocket.send_text(
-                json.dumps({"type": "state", "status": status})
-            )
+            await active_websocket.send_text(json.dumps({"type": "state", "status": status}))
         except Exception:
             pass
 
 async def update_ui_chat(sender: str, content: str):
-    """Push a chat bubble to the React UI."""
     if active_websocket:
         try:
-            await active_websocket.send_text(
-                json.dumps({"type": "text", "sender": sender, "content": content})
-            )
+            await active_websocket.send_text(json.dumps({"type": "text", "sender": sender, "content": content}))
         except Exception:
             pass
 
-
 def _record_turn(sender: str, content: str):
-    """Appends one turn to the in-memory session transcript."""
     global session_started_at
     if session_started_at is None:
         session_started_at = datetime.now()
@@ -155,27 +128,17 @@ def _record_turn(sender: str, content: str):
     })
 
 # -------------------------------------------------------------
-# CORE PIPELINE — called by the wake word thread via run_coroutine_threadsafe
+# CORE PIPELINE
 # -------------------------------------------------------------
 async def on_command_recorded(wav_bytes: bytes):
-    """
-    Full async pipeline triggered once the wake word thread captures a command.
-    Runs on the main asyncio event loop.
-
-    Flow: WAV bytes → STT → Router (regex / LLM) → TTS → WebSocket
-    """
     global maya_is_speaking
-
     await update_ui_state("listening")
 
-    # ── 1. TRANSCRIPTION ──────────────────────────────────────────────────────
     print("[1/3] Transcribing audio with Faster-Whisper...")
     await update_ui_state("processing")
-
     user_text = await transcribe(wav_bytes)
 
     if not user_text.strip():
-        print("-> Empty speech result. Resetting state.")
         await update_ui_state("standby")
         return
 
@@ -183,7 +146,6 @@ async def on_command_recorded(wav_bytes: bytes):
     await update_ui_chat("user", user_text)
     _record_turn("user", user_text)
 
-    # ── 2. HYBRID ROUTER (Regex → Python services → LLM) ────────────────────
     print("[2/3] Routing Task (Hybrid Engine)...")
     maya_response = await route_task(user_text, generate_chat)
 
@@ -191,7 +153,6 @@ async def on_command_recorded(wav_bytes: bytes):
     await update_ui_chat("maya", maya_response)
     _record_turn("maya", maya_response)
 
-    # ── 3. SPEECH SYNTHESIS ───────────────────────────────────────────────────
     print("[3/3] Synthesizing speech with Piper...")
     try:
         tts_audio_bytes = await synthesize(maya_response)
@@ -200,14 +161,10 @@ async def on_command_recorded(wav_bytes: bytes):
         tts_audio_bytes = None
 
     if active_websocket and tts_audio_bytes:
-        # Calculate exact playback duration so the wake word thread mutes for
-        # exactly as long as the audio plays (avoids echo false-triggers).
         with wave.open(__import__("io").BytesIO(tts_audio_bytes)) as wf:
             duration_s = wf.getnframes() / wf.getframerate()
 
-        mute_duration = duration_s + 0.5   # +0.5s echo tail
-        print(f"[Pipeline] Muting mic for {mute_duration:.1f}s audio + 0.5s echo tail")
-
+        mute_duration = duration_s + 0.5
         maya_is_speaking = True
         try:
             await active_websocket.send_bytes(tts_audio_bytes)
@@ -217,18 +174,37 @@ async def on_command_recorded(wav_bytes: bytes):
         await asyncio.sleep(mute_duration)
         maya_is_speaking = False
 
-        # ── EXECUTE SHUTDOWN AFTER AUDIO FINISHES ──
+        # ── EXECUTE SHUTDOWN & SAVE SESSION ──
         if maya_response == "Shutting down the system. Goodbye!":
-            import os
             import signal
-
-            # Flush the whole live session to SQLite BEFORE the process dies.
-            # This is the "stop" trigger point the History page reads from.
+            
+            # SAVES THE SESSION RIGHT BEFORE CLOSING!
             if session_messages:
                 saved_id = save_session(session_messages, session_started_at, datetime.now())
                 print(f"[History] Saved session #{saved_id} ({len(session_messages)} turns).")
 
-            print("[System] Audio finished playing. Pulling the plug.")
+            print("[System] Audio finished playing. Initiating global shutdown...")
+
+            # Tell frontend to close
+            try:
+                await active_websocket.send_text(json.dumps({"type": "command", "action": "close"}))
+            except Exception:
+                pass
+
+            # Terminate other apps
+            TARGETS = ["node.exe", "ollama.exe", "ollama app.exe"]
+            for proc in psutil.process_iter(['name', 'exe', 'cmdline']):
+                try:
+                    proc_name = (proc.info['name'] or "").lower()
+                    proc_exe = (proc.info['exe'] or "").lower()
+                    cmdline = " ".join(proc.info['cmdline'] or []).lower()
+                    if proc_name in TARGETS or "antigravity" in proc_name or "antigravity" in proc_exe or "antigravity" in cmdline:
+                        proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    pass
+
+            await asyncio.sleep(0.5)
+            print("[System] Pulling the plug on the backend.")
             os.kill(os.getpid(), signal.SIGINT)
 
     else:
